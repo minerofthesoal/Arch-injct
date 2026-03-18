@@ -1,0 +1,7 @@
+# Core dependencies (no extra packages needed for CLI-only usage)
+# The CLI works with just the Python standard library + system tools.
+
+# For GUI - install ONE of these:
+# PyQt6>=6.4
+# PyQt5>=5.15
+# qtpy>=2.0   (with either PyQt6 or PyQt5 backend)
