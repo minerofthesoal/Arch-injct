@@ -8,13 +8,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from core.distro_handlers import ArchHandler, DistroHandler, MintHandler
 from core.iso import ArchISO, ISOError
-from core.kernel import KernelError, download_packages, download_signing_key
-from core.surface_devices import (
-    LINUX_SURFACE_REPO_NAME,
-    LINUX_SURFACE_REPO_URL,
-    SurfaceDevice,
-)
+from core.kernel import KernelError
+from core.surface_devices import SurfaceDevice
 from utils.log import get_logger
 
 log = get_logger(__name__)
@@ -26,16 +23,14 @@ class InjectionError(Exception):
 
 class Injector:
     """
-    Orchestrates injecting the linux-surface kernel into an Arch ISO.
+    Orchestrates distro-aware ISO payload injection.
 
     Workflow:
         1. Extract the ISO
         2. Extract the squashfs root filesystem
-        3. Download surface kernel packages
-        4. Install packages into the root filesystem via chroot + pacman
-        5. Configure the linux-surface repository for the installed system
-        6. Rebuild the squashfs
-        7. Rebuild the ISO
+        3. Run distro-specific payload injection
+        4. Rebuild the squashfs
+        5. Rebuild the ISO
     """
 
     def __init__(
@@ -43,14 +38,21 @@ class Injector:
         iso_path: str | Path,
         device: SurfaceDevice,
         output_path: str | Path | None = None,
+        distro: str = "auto",
     ):
         self.device = device
         self.iso = ArchISO(iso_path)
+        self.distro = distro.lower()
+        if self.distro not in {"auto", "arch", "mint"}:
+            raise InjectionError(
+                f"Unsupported distro option: {distro}. Use arch|mint|auto."
+            )
         if output_path is None:
             stem = self.iso.iso_path.stem
             output_path = self.iso.iso_path.parent / f"{stem}-surface.iso"
         self.output_path = Path(output_path).resolve()
         self._progress_cb = None
+        self._handler: DistroHandler | None = None
 
     def set_progress_callback(self, callback):
         """Set a callback: callback(percent: int, message: str)."""
@@ -69,11 +71,9 @@ class Injector:
         if missing:
             issues.append(
                 f"Missing tools: {', '.join(missing)}. "
-                f"Install with: sudo pacman -S squashfs-tools libisoburn"
+                "Install with pacman: sudo pacman -S squashfs-tools libisoburn "
+                "or apt: sudo apt install squashfs-tools xorriso"
             )
-
-        if shutil.which("curl") is None:
-            issues.append("curl is not installed")
 
         # Check disk space
         needed = self.iso.estimate_space_needed_mb()
@@ -90,12 +90,34 @@ class Injector:
             pass
 
         if not self.iso.validate_iso():
-            issues.append("ISO validation failed - may not be a valid Arch Linux ISO")
+            issues.append("ISO validation failed - may not be a readable ISO image")
+
+        detected = self.iso.detect_distro()
+        if self.distro == "auto" and detected == "unknown":
+            issues.append(
+                "Could not detect supported distro from ISO (supported: arch, mint)"
+            )
+        elif self.distro != "auto" and detected != "unknown" and detected != self.distro:
+            issues.append(
+                f"Distro mismatch: requested '{self.distro}' but ISO looks like '{detected}'"
+            )
 
         if self.output_path.exists():
             issues.append(f"Output file already exists: {self.output_path}")
 
         return issues
+
+    def _resolve_handler(self) -> DistroHandler:
+        detected = self.iso.detect_distro()
+        chosen = detected if self.distro == "auto" else self.distro
+        if chosen not in {"arch", "mint"}:
+            raise InjectionError(
+                "Unsupported ISO type. Supported distros: Arch Linux, Linux Mint "
+                "(and Ubuntu-based casper layouts)."
+            )
+        if chosen == "arch":
+            return ArchHandler(self)
+        return MintHandler(self)
 
     def inject(self) -> Path:
         """
@@ -112,52 +134,25 @@ class Injector:
             # Step 1: Extract ISO
             self._progress(5, "Extracting ISO...")
             self.iso.extract(progress_callback=self._progress_cb)
+            self._handler = self._resolve_handler()
+            self._progress(10, f"Detected distro: {self._handler.name}")
+
+            # Distro-specific required tools
+            for tool in self._handler.required_tools:
+                if shutil.which(tool) is None:
+                    raise InjectionError(f"Missing required tool for {self._handler.name}: {tool}")
 
             # Step 2: Find and extract squashfs
             self._progress(20, "Locating root filesystem...")
-            squashfs_path = self.iso.find_squashfs()
+            squashfs_path, root = self._handler.extract_files()
 
-            self._progress(25, "Extracting root filesystem...")
-            self.iso.extract_squashfs(
-                squashfs_path, progress_callback=self._progress_cb
-            )
-
-            root = self.iso.squashfs_dir
-
-            # Step 3: Download kernel packages
-            self._progress(40, "Downloading Surface kernel packages...")
-            pkg_cache = self.iso.work_dir / "pkg_cache"
-            packages = download_packages(
-                self.device, pkg_cache, progress_callback=self._progress_cb
-            )
-
-            # Step 4: Download signing key
-            self._progress(55, "Setting up linux-surface repository...")
-            key_path = download_signing_key(pkg_cache)
-
-            # Step 5: Install into chroot
-            self._progress(58, "Installing Surface kernel into root filesystem...")
-            self._install_into_root(root, packages, key_path)
-
-            # Step 6: Configure the repo in the installed system
-            self._progress(65, "Configuring linux-surface repository...")
-            self._configure_repo(root)
+            # Step 3+: Distro-specific payload
+            self._handler.inject_payload(root)
 
             # Step 7: Rebuild squashfs
             self._progress(70, "Rebuilding root filesystem...")
-            self.iso.rebuild_squashfs(
-                squashfs_path, progress_callback=self._progress_cb
-            )
-
-            # Step 8: Update checksums
-            self._progress(87, "Updating checksums...")
-            self.iso.update_sha512(squashfs_path)
-
-            # Step 9: Rebuild ISO
             self._progress(88, "Rebuilding ISO image...")
-            result = self.iso.rebuild_iso(
-                self.output_path, progress_callback=self._progress_cb
-            )
+            result = self._handler.rebuild_iso(squashfs_path)
 
             self._progress(100, f"Done! Output: {result}")
             return result
@@ -215,26 +210,6 @@ class Injector:
         finally:
             self._unbind_mount(root)
 
-    def _configure_repo(self, root: Path):
-        """Add the linux-surface repo to pacman.conf in the root."""
-        pacman_conf = root / "etc" / "pacman.conf"
-        if not pacman_conf.is_file():
-            log.warning("pacman.conf not found in root - skipping repo config")
-            return
-
-        content = pacman_conf.read_text()
-        repo_block = (
-            f"\n[{LINUX_SURFACE_REPO_NAME}]\n"
-            f"Server = {LINUX_SURFACE_REPO_URL}\n"
-        )
-
-        if LINUX_SURFACE_REPO_NAME not in content:
-            content += repo_block
-            pacman_conf.write_text(content)
-            log.info("Added linux-surface repo to pacman.conf")
-        else:
-            log.info("linux-surface repo already in pacman.conf")
-
     def _bind_mount(self, root: Path):
         """Bind mount /dev, /proc, /sys into the chroot."""
         for mount in ["dev", "proc", "sys"]:
@@ -280,7 +255,14 @@ class Injector:
 
     def _chroot_run(self, root: Path, cmd: list[str]):
         """Run a command inside the chroot."""
-        full_cmd = ["arch-chroot", str(root)] + cmd
+        if shutil.which("arch-chroot"):
+            full_cmd = ["arch-chroot", str(root)] + cmd
+        elif shutil.which("chroot"):
+            full_cmd = ["chroot", str(root)] + cmd
+        else:
+            raise InjectionError(
+                "No chroot runner found (need arch-chroot or chroot)"
+            )
         log.info("chroot: %s", " ".join(cmd))
         try:
             result = subprocess.run(
