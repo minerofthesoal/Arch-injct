@@ -8,6 +8,10 @@ linux-surface Arch repository.
 import re
 import subprocess
 import tempfile
+import tarfile
+import urllib.request
+import json
+from urllib.parse import quote
 from pathlib import Path
 
 from core.surface_devices import (
@@ -25,37 +29,164 @@ class KernelError(Exception):
     """Raised when kernel operations fail."""
 
 
+def _version_key(version: str) -> list[int]:
+    """
+    Convert a package version string into sortable integer chunks.
+    """
+    return [int(p) for p in re.findall(r"\d+", version)]
+
+
+def _fetch_repo_metadata_from_github() -> list[tuple[str, str, str]]:
+    """
+    Fallback metadata source using linux-surface/repo GitHub API directory listings.
+    """
+    repo_api = "https://api.github.com/repos/linux-surface/repo"
+    headers = {"User-Agent": "surface-iso-injector"}
+
+    try:
+        req = urllib.request.Request(repo_api, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            repo_info = json.loads(resp.read().decode("utf-8"))
+        default_branch = repo_info.get("default_branch", "u/staging")
+
+        content_url = (
+            "https://api.github.com/repos/linux-surface/repo/contents/arch"
+            f"?ref={quote(default_branch, safe='')}"
+        )
+        req = urllib.request.Request(content_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            entries = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise KernelError(
+            f"Failed to query linux-surface GitHub metadata fallback: {exc}"
+        ) from exc
+
+    packages: list[tuple[str, str, str]] = []
+    for item in entries:
+        name = item.get("name", "")
+        if not name.endswith(".pkg.tar.zst.blob"):
+            continue
+
+        filename = name.removesuffix(".blob")
+        m = re.match(
+            r"^(?P<stem>.+)-(?P<rel>\d+)-(?P<arch>x86_64|any)\.pkg\.tar\.\w+$",
+            filename,
+        )
+        if not m:
+            continue
+        stem = m.group("stem")
+        rel = m.group("rel")
+
+        m2 = re.match(r"^(?P<pkg>.+)-(?P<ver>\d[0-9A-Za-z._+]*)$", stem)
+        if not m2:
+            continue
+
+        pkg_name = m2.group("pkg")
+        version = f"{m2.group('ver')}-{rel}"
+        packages.append((pkg_name, version, filename))
+
+    if not packages:
+        raise KernelError(
+            "Could not extract package metadata from linux-surface GitHub repo listing"
+        )
+    log.info(
+        "Using linux-surface metadata fallback from GitHub repo API (%d packages)",
+        len(packages),
+    )
+    return packages
+
+
+def _fetch_repo_metadata() -> list[tuple[str, str, str]]:
+    """
+    Read package metadata from linux-surface.db.
+
+    Returns tuples of (package_name, package_version, package_filename).
+    """
+    repo_db_url = f"{LINUX_SURFACE_REPO_URL}x86_64/{LINUX_SURFACE_REPO_NAME}.db"
+    with tempfile.TemporaryDirectory(prefix="surface-db-") as tmp:
+        db_path = Path(tmp) / f"{LINUX_SURFACE_REPO_NAME}.db"
+
+        try:
+            subprocess.run(
+                ["curl", "-sL", "-o", str(db_path), repo_db_url],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise KernelError(
+                f"Failed to download linux-surface repo database: {exc}"
+            ) from exc
+
+        if not db_path.exists() or db_path.stat().st_size == 0:
+            log.warning(
+                "Downloaded linux-surface repo database is empty (%s); "
+                "falling back to GitHub metadata API.",
+                repo_db_url,
+            )
+            return _fetch_repo_metadata_from_github()
+
+        packages: list[tuple[str, str, str]] = []
+        try:
+            with tarfile.open(db_path, mode="r:*") as tar:
+                # pacman DB format: <pkgname-version>/desc
+                for member in tar.getmembers():
+                    if not member.isfile() or not member.name.endswith("/desc"):
+                        continue
+                    desc = tar.extractfile(member)
+                    if desc is None:
+                        continue
+                    text = desc.read().decode("utf-8", errors="ignore")
+                    fields: dict[str, str] = {}
+                    lines = text.splitlines()
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i].strip()
+                        if line.startswith("%") and line.endswith("%"):
+                            key = line.strip("%")
+                            i += 1
+                            value_lines: list[str] = []
+                            while i < len(lines) and lines[i].strip() != "":
+                                value_lines.append(lines[i].strip())
+                                i += 1
+                            if value_lines:
+                                fields[key] = value_lines[0]
+                        i += 1
+
+                    name = fields.get("NAME")
+                    version = fields.get("VERSION")
+                    filename = fields.get("FILENAME")
+                    if name and version and filename:
+                        packages.append((name, version, filename))
+        except tarfile.TarError:
+            log.warning(
+                "Failed to parse linux-surface repo DB tarball; "
+                "falling back to GitHub metadata API."
+            )
+            return _fetch_repo_metadata_from_github()
+
+        if not packages:
+            log.warning(
+                "No package entries found in linux-surface DB; "
+                "falling back to GitHub metadata API."
+            )
+            return _fetch_repo_metadata_from_github()
+
+        return packages
+
+
 def fetch_latest_kernel_version() -> str:
     """
     Query the linux-surface Arch repo to find the latest kernel version.
     Returns version string like '6.6.7-1'.
     """
-    try:
-        result = subprocess.run(
-            [
-                "curl", "-sL",
-                f"{LINUX_SURFACE_REPO_URL}x86_64/",
-            ],
-            capture_output=True, text=True, timeout=30, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise KernelError(f"Failed to query linux-surface repo: {exc}") from exc
-
-    # Parse package names like linux-surface-6.6.7-1-x86_64.pkg.tar.zst
-    pattern = r"linux-surface-(\d+\.\d+[\.\d]*-\d+)-x86_64\.pkg\.tar\.\w+"
-    versions = re.findall(pattern, result.stdout)
+    packages = _fetch_repo_metadata()
+    versions = [version for name, version, _ in packages if name == "linux-surface"]
 
     if not versions:
         raise KernelError(
             "Could not find any linux-surface kernel packages in the repository"
         )
 
-    # Sort by version components to find the latest
-    def version_key(v: str):
-        parts = re.split(r"[.\-]", v)
-        return [int(p) for p in parts if p.isdigit()]
-
-    versions.sort(key=version_key, reverse=True)
+    versions.sort(key=_version_key, reverse=True)
     latest = versions[0]
     log.info("Latest linux-surface kernel: %s", latest)
     return latest
@@ -84,6 +215,7 @@ def download_packages(
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     all_packages = [device.kernel_variant] + device.extra_packages
+    repo_packages = _fetch_repo_metadata()
 
     downloaded: list[Path] = []
 
@@ -97,28 +229,20 @@ def download_packages(
         # Use a temporary pacman-style DB sync to grab the package
         # We'll download the package file directly
         try:
-            # First, find the exact filename
-            result = subprocess.run(
-                ["curl", "-sL", f"{LINUX_SURFACE_REPO_URL}x86_64/"],
-                capture_output=True, text=True, timeout=30, check=True,
-            )
-
-            # Find the matching package file
-            pattern = re.escape(pkg_name) + r"-[\d][^\s\"'<>]+-x86_64\.pkg\.tar\.\w+"
-            matches = re.findall(pattern, result.stdout)
+            matches = [
+                (version, filename)
+                for name, version, filename in repo_packages
+                if name == pkg_name
+            ]
 
             if not matches:
                 raise KernelError(
                     f"Package {pkg_name} not found in linux-surface repo"
                 )
 
-            # Pick the latest version
-            def version_key(filename: str):
-                parts = re.findall(r"\d+", filename)
-                return [int(p) for p in parts]
-
-            matches.sort(key=version_key, reverse=True)
-            filename = matches[0]
+            # Pick the latest package version
+            matches.sort(key=lambda x: _version_key(x[0]), reverse=True)
+            filename = matches[0][1]
 
             pkg_url = f"{LINUX_SURFACE_REPO_URL}x86_64/{filename}"
             pkg_dest = dest_dir / filename
