@@ -133,13 +133,35 @@ class ArchISO:
         if progress_callback:
             progress_callback(25, "Extracting root filesystem...")
 
+        cmd = ["unsquashfs", "-d", str(self.squashfs_dir), "-f", str(squashfs_path)]
         try:
             subprocess.run(
-                ["unsquashfs", "-d", str(self.squashfs_dir), "-f", str(squashfs_path)],
+                cmd,
                 capture_output=True, text=True, check=True, timeout=600,
             )
         except subprocess.CalledProcessError as exc:
-            raise ISOError(f"Squashfs extraction failed: {exc.stderr}") from exc
+            err = (exc.stderr or "") + (exc.stdout or "")
+            xattr_error = (
+                "could not write xattr" in err.lower()
+                or "security.capability" in err.lower()
+            )
+            if not xattr_error:
+                raise ISOError(f"Squashfs extraction failed: {exc.stderr}") from exc
+
+            # Non-root users can fail on security.capability xattrs.
+            # Retry without xattrs so CLI usage works without sudo.
+            log.warning(
+                "unsquashfs failed while restoring xattrs; retrying with -no-xattrs"
+            )
+            try:
+                subprocess.run(
+                    cmd[:1] + ["-no-xattrs"] + cmd[1:],
+                    capture_output=True, text=True, check=True, timeout=600,
+                )
+            except subprocess.CalledProcessError as retry_exc:
+                raise ISOError(
+                    f"Squashfs extraction failed: {retry_exc.stderr}"
+                ) from retry_exc
 
         if progress_callback:
             progress_callback(40, "Root filesystem extracted")
