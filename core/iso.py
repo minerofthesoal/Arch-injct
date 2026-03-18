@@ -1,7 +1,7 @@
 """
 ISO manipulation module.
 
-Handles extracting, modifying, and rebuilding Arch Linux ISO images.
+Handles extracting, modifying, and rebuilding supported Linux ISO images.
 """
 
 import hashlib
@@ -20,7 +20,7 @@ class ISOError(Exception):
 
 
 class ArchISO:
-    """Manages extraction, modification, and rebuild of an Arch Linux ISO."""
+    """Manages extraction, modification, and rebuild of supported Linux ISOs."""
 
     REQUIRED_TOOLS = ["xorriso", "unsquashfs", "mksquashfs"]
 
