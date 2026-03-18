@@ -9,6 +9,9 @@ import re
 import subprocess
 import tempfile
 import tarfile
+import urllib.request
+import json
+from urllib.parse import quote
 from pathlib import Path
 
 from core.surface_devices import (
@@ -33,6 +36,66 @@ def _version_key(version: str) -> list[int]:
     return [int(p) for p in re.findall(r"\d+", version)]
 
 
+def _fetch_repo_metadata_from_github() -> list[tuple[str, str, str]]:
+    """
+    Fallback metadata source using linux-surface/repo GitHub API directory listings.
+    """
+    repo_api = "https://api.github.com/repos/linux-surface/repo"
+    headers = {"User-Agent": "surface-iso-injector"}
+
+    try:
+        req = urllib.request.Request(repo_api, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            repo_info = json.loads(resp.read().decode("utf-8"))
+        default_branch = repo_info.get("default_branch", "u/staging")
+
+        content_url = (
+            "https://api.github.com/repos/linux-surface/repo/contents/arch"
+            f"?ref={quote(default_branch, safe='')}"
+        )
+        req = urllib.request.Request(content_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            entries = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise KernelError(
+            f"Failed to query linux-surface GitHub metadata fallback: {exc}"
+        ) from exc
+
+    packages: list[tuple[str, str, str]] = []
+    for item in entries:
+        name = item.get("name", "")
+        if not name.endswith(".pkg.tar.zst.blob"):
+            continue
+
+        filename = name.removesuffix(".blob")
+        m = re.match(
+            r"^(?P<stem>.+)-(?P<rel>\d+)-(?P<arch>x86_64|any)\.pkg\.tar\.\w+$",
+            filename,
+        )
+        if not m:
+            continue
+        stem = m.group("stem")
+        rel = m.group("rel")
+
+        m2 = re.match(r"^(?P<pkg>.+)-(?P<ver>\d[0-9A-Za-z._+]*)$", stem)
+        if not m2:
+            continue
+
+        pkg_name = m2.group("pkg")
+        version = f"{m2.group('ver')}-{rel}"
+        packages.append((pkg_name, version, filename))
+
+    if not packages:
+        raise KernelError(
+            "Could not extract package metadata from linux-surface GitHub repo listing"
+        )
+    log.info(
+        "Using linux-surface metadata fallback from GitHub repo API (%d packages)",
+        len(packages),
+    )
+    return packages
+
+
 def _fetch_repo_metadata() -> list[tuple[str, str, str]]:
     """
     Read package metadata from linux-surface.db.
@@ -54,44 +117,58 @@ def _fetch_repo_metadata() -> list[tuple[str, str, str]]:
             ) from exc
 
         if not db_path.exists() or db_path.stat().st_size == 0:
-            raise KernelError("Downloaded linux-surface repo database is empty")
+            log.warning(
+                "Downloaded linux-surface repo database is empty (%s); "
+                "falling back to GitHub metadata API.",
+                repo_db_url,
+            )
+            return _fetch_repo_metadata_from_github()
 
         packages: list[tuple[str, str, str]] = []
-        with tarfile.open(db_path, mode="r:*") as tar:
-            # pacman DB format: <pkgname-version>/desc
-            for member in tar.getmembers():
-                if not member.isfile() or not member.name.endswith("/desc"):
-                    continue
-                desc = tar.extractfile(member)
-                if desc is None:
-                    continue
-                text = desc.read().decode("utf-8", errors="ignore")
-                fields: dict[str, str] = {}
-                lines = text.splitlines()
-                i = 0
-                while i < len(lines):
-                    line = lines[i].strip()
-                    if line.startswith("%") and line.endswith("%"):
-                        key = line.strip("%")
-                        i += 1
-                        value_lines: list[str] = []
-                        while i < len(lines) and lines[i].strip() != "":
-                            value_lines.append(lines[i].strip())
+        try:
+            with tarfile.open(db_path, mode="r:*") as tar:
+                # pacman DB format: <pkgname-version>/desc
+                for member in tar.getmembers():
+                    if not member.isfile() or not member.name.endswith("/desc"):
+                        continue
+                    desc = tar.extractfile(member)
+                    if desc is None:
+                        continue
+                    text = desc.read().decode("utf-8", errors="ignore")
+                    fields: dict[str, str] = {}
+                    lines = text.splitlines()
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i].strip()
+                        if line.startswith("%") and line.endswith("%"):
+                            key = line.strip("%")
                             i += 1
-                        if value_lines:
-                            fields[key] = value_lines[0]
-                    i += 1
+                            value_lines: list[str] = []
+                            while i < len(lines) and lines[i].strip() != "":
+                                value_lines.append(lines[i].strip())
+                                i += 1
+                            if value_lines:
+                                fields[key] = value_lines[0]
+                        i += 1
 
-                name = fields.get("NAME")
-                version = fields.get("VERSION")
-                filename = fields.get("FILENAME")
-                if name and version and filename:
-                    packages.append((name, version, filename))
+                    name = fields.get("NAME")
+                    version = fields.get("VERSION")
+                    filename = fields.get("FILENAME")
+                    if name and version and filename:
+                        packages.append((name, version, filename))
+        except tarfile.TarError:
+            log.warning(
+                "Failed to parse linux-surface repo DB tarball; "
+                "falling back to GitHub metadata API."
+            )
+            return _fetch_repo_metadata_from_github()
 
         if not packages:
-            raise KernelError(
-                "Could not find package metadata in linux-surface repo database"
+            log.warning(
+                "No package entries found in linux-surface DB; "
+                "falling back to GitHub metadata API."
             )
+            return _fetch_repo_metadata_from_github()
 
         return packages
 
