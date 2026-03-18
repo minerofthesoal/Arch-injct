@@ -52,8 +52,8 @@ def c(text: str, color: str) -> str:
 
 def print_banner():
     print(c(BANNER, "cyan"))
-    print(c("  Arch Linux Surface Kernel ISO Injector", "bold"))
-    print(c("  Inject linux-surface kernel into your Arch installer\n", "blue"))
+    print(c("  Surface Kernel ISO Injector (Arch + Mint)", "bold"))
+    print(c("  Inject Surface payloads into supported installer ISOs\n", "blue"))
 
 
 def print_device_table():
@@ -94,7 +94,7 @@ def interactive_select_device() -> str:
 def interactive_select_iso() -> str:
     """Interactively prompt for the ISO file path."""
     while True:
-        path = input(c("\n  Enter path to Arch Linux ISO: ", "green")).strip()
+        path = input(c("\n  Enter path to ISO (Arch or Mint): ", "green")).strip()
         # Strip surrounding quotes
         path = path.strip("'\"")
         p = Path(path).expanduser().resolve()
@@ -185,7 +185,7 @@ def cmd_inject(args):
             return 0
 
     # Run injection
-    injector = Injector(iso_path, device, output_path)
+    injector = Injector(iso_path, device, output_path, distro=args.distro)
     injector.set_progress_callback(progress_bar)
 
     # Preflight
@@ -274,12 +274,13 @@ def cmd_check(args):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="surface-iso-injector",
-        description="Inject linux-surface kernel into an Arch Linux installer ISO",
+        description="Inject Surface payload into Arch Linux or Linux Mint installer ISOs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
   %(prog)s inject                          Interactive mode
   %(prog)s inject -d sp7 -i arch.iso       Non-interactive injection
+  %(prog)s inject -d sp7 -i mint.iso --distro mint
   %(prog)s inject -d sp7 -i arch.iso -y    Skip confirmation
   %(prog)s info -d sp7                     Show device info
   %(prog)s info --check-version            Show latest kernel version
@@ -303,7 +304,12 @@ examples:
     )
     p_inject.add_argument(
         "-i", "--iso", type=str, default=None,
-        help="Path to Arch Linux ISO file. Omit for interactive selection",
+        help="Path to ISO file (Arch or Mint). Omit for interactive selection",
+    )
+    p_inject.add_argument(
+        "--distro", type=str, default="auto",
+        choices=["auto", "arch", "mint"],
+        help="Distro mode (default: auto-detect from ISO)",
     )
     p_inject.add_argument(
         "-o", "--output", type=str, default=None,
@@ -383,7 +389,7 @@ def interactive_mode() -> int:
     device_id = interactive_select_device()
 
     # Step 3: select ISO
-    print(c("\n  [3/3] Select your Arch Linux ISO:", "bold"))
+    print(c("\n  [3/3] Select your ISO:", "bold"))
     iso_path = interactive_select_iso()
 
     output_path = interactive_select_output(iso_path)
@@ -399,7 +405,7 @@ def interactive_mode() -> int:
         print(c("  Aborted.", "yellow"))
         return 0
 
-    injector = Injector(iso_path, device, output_path)
+    injector = Injector(iso_path, device, output_path, distro="auto")
     injector.set_progress_callback(progress_bar)
 
     try:

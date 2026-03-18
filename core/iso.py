@@ -5,7 +5,6 @@ Handles extracting, modifying, and rebuilding Arch Linux ISO images.
 """
 
 import hashlib
-import os
 import shutil
 import subprocess
 import tempfile
@@ -69,18 +68,63 @@ class ArchISO:
         return self._squashfs_dir
 
     def validate_iso(self) -> bool:
-        """Basic validation that this looks like an Arch Linux ISO."""
+        """Basic validation that this is a readable ISO image."""
         try:
             result = subprocess.run(
                 ["xorriso", "-indev", str(self.iso_path), "-ls", "/"],
                 capture_output=True, text=True, timeout=30
             )
             output = result.stdout + result.stderr
-            return result.returncode == 0 and (
-                "arch" in output.lower() or len(output.strip()) > 0
-            )
+            return result.returncode == 0 and len(output.strip()) > 0
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
+
+    def detect_distro(self) -> str:
+        """
+        Detect distro family from ISO label and filesystem layout.
+        Returns: "arch", "mint", or "unknown".
+        """
+        label = self.get_iso_label().lower()
+
+        if any(x in label for x in ["arch", "archlinux"]):
+            return "arch"
+        if any(x in label for x in ["mint", "linuxmint", "ubuntu"]):
+            return "mint"
+
+        root_listing = self._iso_ls("/")
+        if "casper" in root_listing:
+            return "mint"
+        if "arch" in root_listing:
+            return "arch"
+        return "unknown"
+
+    def get_iso_label(self) -> str:
+        """Read ISO volume label via xorriso."""
+        try:
+            result = subprocess.run(
+                ["xorriso", "-indev", str(self.iso_path), "-pvd_info"],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return ""
+
+        for line in (result.stdout + "\n" + result.stderr).splitlines():
+            if "Volume id" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    return parts[1].strip().strip("'\"")
+        return ""
+
+    def _iso_ls(self, iso_path: str) -> str:
+        """List path directly from ISO without full extraction."""
+        try:
+            result = subprocess.run(
+                ["xorriso", "-indev", str(self.iso_path), "-ls", iso_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            return (result.stdout + "\n" + result.stderr).lower()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return ""
 
     def extract(self, progress_callback=None) -> Path:
         """Extract the ISO contents."""
@@ -105,17 +149,28 @@ class ArchISO:
         log.info("ISO extracted to %s", self.extract_dir)
         return self.extract_dir
 
-    def find_squashfs(self) -> Path:
-        """Locate the airootfs squashfs image inside the extracted ISO."""
+    def find_squashfs(self, distro: str = "arch") -> Path:
+        """Locate the distro rootfs image inside the extracted ISO."""
         candidates = [
             self.extract_dir / "arch" / "x86_64" / "airootfs.sfs",
             self.extract_dir / "arch" / "x86_64" / "airootfs.erofs",
+            self.extract_dir / "casper" / "filesystem.squashfs",
         ]
+        if distro == "mint":
+            candidates = [
+                self.extract_dir / "casper" / "filesystem.squashfs",
+                self.extract_dir / "casper" / "filesystem.sfs",
+            ] + candidates
+
         # Also search recursively
         for sfs in self.extract_dir.rglob("airootfs.sfs"):
             candidates.insert(0, sfs)
         for erofs in self.extract_dir.rglob("airootfs.erofs"):
             candidates.insert(0, erofs)
+        for mint_fs in self.extract_dir.rglob("filesystem.squashfs"):
+            candidates.insert(0, mint_fs)
+        for mint_sfs in self.extract_dir.rglob("filesystem.sfs"):
+            candidates.insert(0, mint_sfs)
 
         for candidate in candidates:
             if candidate.is_file():
@@ -123,8 +178,9 @@ class ArchISO:
                 return candidate
 
         raise ISOError(
-            "Could not find airootfs.sfs or airootfs.erofs in extracted ISO. "
-            "Is this a valid Arch Linux ISO?"
+            "Could not find supported rootfs image "
+            "(airootfs.sfs/airootfs.erofs/filesystem.squashfs). "
+            "Is this a supported Arch or Mint ISO?"
         )
 
     def extract_squashfs(self, squashfs_path: Path, progress_callback=None) -> Path:
@@ -133,13 +189,35 @@ class ArchISO:
         if progress_callback:
             progress_callback(25, "Extracting root filesystem...")
 
+        cmd = ["unsquashfs", "-d", str(self.squashfs_dir), "-f", str(squashfs_path)]
         try:
             subprocess.run(
-                ["unsquashfs", "-d", str(self.squashfs_dir), "-f", str(squashfs_path)],
+                cmd,
                 capture_output=True, text=True, check=True, timeout=600,
             )
         except subprocess.CalledProcessError as exc:
-            raise ISOError(f"Squashfs extraction failed: {exc.stderr}") from exc
+            err = (exc.stderr or "") + (exc.stdout or "")
+            xattr_error = (
+                "could not write xattr" in err.lower()
+                or "security.capability" in err.lower()
+            )
+            if not xattr_error:
+                raise ISOError(f"Squashfs extraction failed: {exc.stderr}") from exc
+
+            # Non-root users can fail on security.capability xattrs.
+            # Retry without xattrs so CLI usage works without sudo.
+            log.warning(
+                "unsquashfs failed while restoring xattrs; retrying with -no-xattrs"
+            )
+            try:
+                subprocess.run(
+                    cmd[:1] + ["-no-xattrs"] + cmd[1:],
+                    capture_output=True, text=True, check=True, timeout=600,
+                )
+            except subprocess.CalledProcessError as retry_exc:
+                raise ISOError(
+                    f"Squashfs extraction failed: {retry_exc.stderr}"
+                ) from retry_exc
 
         if progress_callback:
             progress_callback(40, "Root filesystem extracted")
@@ -205,6 +283,7 @@ class ArchISO:
         for candidate in [
             self.extract_dir / "EFI" / "archiso" / "efiboot.img",
             self.extract_dir / "boot" / "grub" / "efi.img",
+            self.extract_dir / "boot" / "grub" / "efiboot.img",
         ]:
             if candidate.is_file():
                 efi_boot = candidate
@@ -216,18 +295,33 @@ class ArchISO:
 
         efi_rel = str(efi_boot.relative_to(self.extract_dir)) if efi_boot else None
 
+        bios_boot = None
+        boot_catalog = None
+        for bios_candidate, cat_candidate in [
+            ("boot/syslinux/isolinux.bin", "boot/syslinux/boot.cat"),  # Arch
+            ("isolinux/isolinux.bin", "isolinux/boot.cat"),            # Mint/Ubuntu
+        ]:
+            if (self.extract_dir / bios_candidate).is_file():
+                bios_boot = bios_candidate
+                boot_catalog = cat_candidate
+                break
+
+        volid = self.get_iso_label() or "SURFACE_CUSTOM"
         cmd = [
             "xorriso",
             "-as", "mkisofs",
             "-iso-level", "3",
             "-full-iso9660-filenames",
-            "-volid", "ARCH_SURFACE",
-            "-eltorito-boot", "boot/syslinux/isolinux.bin",
-            "-eltorito-catalog", "boot/syslinux/boot.cat",
-            "-no-emul-boot",
-            "-boot-load-size", "4",
-            "-boot-info-table",
+            "-volid", volid,
         ]
+        if bios_boot and boot_catalog:
+            cmd += [
+                "-eltorito-boot", bios_boot,
+                "-eltorito-catalog", boot_catalog,
+                "-no-emul-boot",
+                "-boot-load-size", "4",
+                "-boot-info-table",
+            ]
 
         if efi_rel:
             cmd += [
@@ -238,8 +332,8 @@ class ArchISO:
             ]
 
         # Check for isolinux.bin / syslinux - adjust if hybrid MBR needed
-        isolinux = self.extract_dir / "boot" / "syslinux" / "isolinux.bin"
-        if isolinux.is_file():
+        if bios_boot:
+            isolinux = self.extract_dir / bios_boot
             cmd += ["-isohybrid-mbr", str(isolinux)]
 
         cmd += ["-output", str(output_path), str(self.extract_dir)]
