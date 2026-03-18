@@ -5,6 +5,7 @@ Provides an interactive and argument-based command-line interface.
 """
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -241,7 +242,6 @@ def cmd_info(args):
 def cmd_check(args):
     """Handle the 'check' subcommand - verify dependencies."""
     from core.iso import ArchISO
-    import shutil
 
     print(c("\n  Dependency Check:", "bold"))
     print(c("  " + "=" * 40, "blue"))
@@ -252,7 +252,7 @@ def cmd_check(args):
         "unsquashfs": "squashfs-tools",
         "mksquashfs": "squashfs-tools",
         "curl": "curl",
-        "arch-chroot": "arch-install-scripts",
+        "chroot": "coreutils (or arch-install-scripts for arch-chroot)",
     }
 
     for tool, pkg in tools.items():
@@ -263,10 +263,22 @@ def cmd_check(args):
         if not found:
             all_ok = False
 
+    # At least one chroot runner should exist for Arch payload injection.
+    has_arch_chroot = shutil.which("arch-chroot") is not None
+    has_chroot = shutil.which("chroot") is not None
+    if not (has_arch_chroot or has_chroot):
+        all_ok = False
+        print(c(
+            "    chroot runner missing  ✗ missing  (install arch-install-scripts or coreutils)",
+            "yellow",
+        ))
+
     if all_ok:
         print(c("\n  All dependencies satisfied!", "green"))
     else:
         print(c("\n  Install missing packages before proceeding.", "yellow"))
+        print(c("  Arch hosts: sudo pacman -S squashfs-tools libisoburn curl arch-install-scripts", "yellow"))
+        print(c("  Mint/Ubuntu hosts: sudo apt install squashfs-tools xorriso curl coreutils", "yellow"))
 
     return 0 if all_ok else 1
 
@@ -380,7 +392,8 @@ def interactive_mode() -> int:
     missing = ArchISO.check_dependencies()
     if missing:
         print(c(f"  Missing tools: {', '.join(missing)}", "red"))
-        print(c("  Install them first: sudo pacman -S squashfs-tools libisoburn", "yellow"))
+        print(c("  Arch: sudo pacman -S squashfs-tools libisoburn", "yellow"))
+        print(c("  Mint/Ubuntu: sudo apt install squashfs-tools xorriso", "yellow"))
         return 1
     print(c("  All dependencies OK.\n", "green"))
 

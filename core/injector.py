@@ -71,7 +71,8 @@ class Injector:
         if missing:
             issues.append(
                 f"Missing tools: {', '.join(missing)}. "
-                f"Install with: sudo pacman -S squashfs-tools libisoburn"
+                "Install with pacman: sudo pacman -S squashfs-tools libisoburn "
+                "or apt: sudo apt install squashfs-tools xorriso"
             )
 
         # Check disk space
@@ -254,7 +255,14 @@ class Injector:
 
     def _chroot_run(self, root: Path, cmd: list[str]):
         """Run a command inside the chroot."""
-        full_cmd = ["arch-chroot", str(root)] + cmd
+        if shutil.which("arch-chroot"):
+            full_cmd = ["arch-chroot", str(root)] + cmd
+        elif shutil.which("chroot"):
+            full_cmd = ["chroot", str(root)] + cmd
+        else:
+            raise InjectionError(
+                "No chroot runner found (need arch-chroot or chroot)"
+            )
         log.info("chroot: %s", " ".join(cmd))
         try:
             result = subprocess.run(

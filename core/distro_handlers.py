@@ -58,7 +58,7 @@ class ArchHandler(DistroHandler):
 
     @property
     def required_tools(self) -> list[str]:
-        return ["curl", "arch-chroot", "mount", "umount"]
+        return ["curl", "mount", "umount", "chroot"]
 
     def inject_payload(self, root: Path):
         self.injector._progress(40, "Downloading Surface kernel packages...")
@@ -168,4 +168,3 @@ class MintHandler(DistroHandler):
             if changed:
                 cfg.write_text("\n".join(out) + "\n")
                 log.info("Patched Mint boot config: %s", cfg)
-
