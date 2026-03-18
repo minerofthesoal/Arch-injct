@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "surface-iso-injector"
+version = "1.0.0"
+description = "Inject the linux-surface kernel into Arch Linux installer ISOs"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Surface ISO Injector Contributors"},
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.4"]
+gui-qt5 = ["PyQt5>=5.15"]
+gui-qtpy = ["qtpy>=2.0"]
+
+[project.scripts]
+surface-iso-injector = "surface_inject:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "cli*", "gui*", "utils*"]
