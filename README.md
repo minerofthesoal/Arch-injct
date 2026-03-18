@@ -9,7 +9,7 @@ Inject Surface payloads into installer ISOs with distro-aware workflows:
 1. Detects ISO distro (`arch`, `mint`, or `auto`)
 2. Extracts ISO + rootfs (`airootfs.*` for Arch, `casper/filesystem.squashfs` for Mint/Ubuntu)
 3. Runs distro-specific injection:
-   - Arch: downloads and installs `linux-surface` packages into chroot (with automatic fallback to in-chroot `pacman -Sy` if direct package-file lookup fails)
+   - Arch: downloads and installs `linux-surface` packages into chroot
    - Mint/Ubuntu: installs payload scripts/systemd service + casper-friendly boot marker
 4. Rebuilds the squashfs and ISO
 
@@ -212,7 +212,7 @@ Arch-injct/
 2. **Distro detection** — detects Arch vs Mint/Ubuntu using ISO label + filesystem hints (`/arch`, `/casper`)
 3. **Rootfs extraction** — `unsquashfs` unpacks either `airootfs.sfs` (Arch) or `casper/filesystem.squashfs` (Mint/Ubuntu)
 4. **Payload injection**
-   - Arch: download `linux-surface` packages and install in chroot (`arch-chroot` or `chroot`), with repo-install fallback
+   - Arch: download `linux-surface` packages and install in chroot (`arch-chroot` or `chroot`)
    - Mint/Ubuntu: install payload scripts + service + boot marker in grub config
 5. **Squashfs rebuild** — `mksquashfs` repacks the modified root
 6. **Checksum update** — updates sha512 checksums for rebuilt squashfs

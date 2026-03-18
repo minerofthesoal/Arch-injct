@@ -54,9 +54,7 @@ def _fetch_repo_metadata() -> list[tuple[str, str, str]]:
             ) from exc
 
         if not db_path.exists() or db_path.stat().st_size == 0:
-            raise KernelError(
-                f"Downloaded linux-surface repo database is empty ({repo_db_url})"
-            )
+            raise KernelError("Downloaded linux-surface repo database is empty")
 
         packages: list[tuple[str, str, str]] = []
         with tarfile.open(db_path, mode="r:*") as tar:

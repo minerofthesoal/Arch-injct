@@ -194,40 +194,6 @@ class Injector:
         finally:
             self._unbind_mount(root)
 
-    def _install_into_root_from_repo(
-        self, root: Path, package_names: list[str], key_path: Path
-    ):
-        """
-        Install packages directly from configured repositories inside the chroot.
-        Used as fallback when direct package-file lookup/download fails.
-        """
-        self._bind_mount(root)
-        try:
-            self._prepare_arch_pacman(root, key_path)
-            self._chroot_run(root, [
-                "pacman", "-Sy", "--noconfirm", *package_names,
-            ])
-        finally:
-            self._unbind_mount(root)
-
-    def _prepare_arch_pacman(self, root: Path, key_path: Path):
-        """Initialize pacman keyring in the chroot and trust linux-surface key."""
-        self._chroot_run(root, [
-            "pacman-key", "--init",
-        ])
-        self._chroot_run(root, [
-            "pacman-key", "--populate", "archlinux",
-        ])
-
-        shutil.copy2(key_path, root / "tmp" / "surface.asc")
-        self._chroot_run(root, [
-            "pacman-key", "--add", "/tmp/surface.asc",
-        ])
-        self._chroot_run(root, [
-            "pacman-key", "--lsign-key",
-            "56C464BAAC421453",
-        ])
-
     def _bind_mount(self, root: Path):
         """Bind mount /dev, /proc, /sys into the chroot."""
         for mount in ["dev", "proc", "sys"]:

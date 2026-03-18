@@ -8,7 +8,7 @@ import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from core.kernel import KernelError, download_packages, download_signing_key
+from core.kernel import download_packages, download_signing_key
 from core.surface_devices import LINUX_SURFACE_REPO_NAME, LINUX_SURFACE_REPO_URL
 from utils.log import get_logger
 
@@ -61,33 +61,20 @@ class ArchHandler(DistroHandler):
         return ["curl", "mount", "umount", "chroot"]
 
     def inject_payload(self, root: Path):
+        self.injector._progress(40, "Downloading Surface kernel packages...")
         pkg_cache = self.injector.iso.work_dir / "pkg_cache"
+        packages = download_packages(
+            self.injector.device, pkg_cache, progress_callback=self.injector._progress_cb
+        )
+
         self.injector._progress(55, "Setting up linux-surface repository...")
         key_path = download_signing_key(pkg_cache)
+
+        self.injector._progress(58, "Installing Surface kernel into root filesystem...")
+        self.injector._install_into_root(root, packages, key_path)
+
+        self.injector._progress(65, "Configuring linux-surface repository...")
         self._configure_repo(root)
-
-        self.injector._progress(40, "Downloading Surface kernel packages...")
-        package_names = [self.injector.device.kernel_variant] + self.injector.device.extra_packages
-        try:
-            packages = download_packages(
-                self.injector.device, pkg_cache, progress_callback=self.injector._progress_cb
-            )
-            self.injector._progress(58, "Installing Surface kernel into root filesystem...")
-            self.injector._install_into_root(root, packages, key_path)
-            return
-        except KernelError as exc:
-            log.warning(
-                "Package file lookup/download failed (%s). "
-                "Falling back to in-chroot pacman install from linux-surface repo.",
-                exc,
-            )
-            self.injector._progress(
-                58,
-                "Falling back to direct in-chroot package install from linux-surface repo...",
-            )
-            self.injector._install_into_root_from_repo(root, package_names, key_path)
-
-        self.injector._progress(65, "Configured linux-surface repository")
 
     def _configure_repo(self, root: Path):
         pacman_conf = root / "etc" / "pacman.conf"
