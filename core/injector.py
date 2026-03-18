@@ -181,23 +181,7 @@ class Injector:
         self._bind_mount(root)
 
         try:
-            # Import the signing key
-            self._chroot_run(root, [
-                "pacman-key", "--init",
-            ])
-            self._chroot_run(root, [
-                "pacman-key", "--populate", "archlinux",
-            ])
-
-            # Import surface key
-            shutil.copy2(key_path, root / "tmp" / "surface.asc")
-            self._chroot_run(root, [
-                "pacman-key", "--add", "/tmp/surface.asc",
-            ])
-            self._chroot_run(root, [
-                "pacman-key", "--lsign-key",
-                "56C464BAAC421453",
-            ])
+            self._prepare_arch_pacman(root, key_path)
 
             # Install the packages
             pkg_paths = [
@@ -274,8 +258,8 @@ class Injector:
                     "chroot command returned %d: %s",
                     result.returncode, result.stderr,
                 )
-                # Don't raise for non-critical commands
-                if "pacman" in cmd[0] and "-U" in cmd:
+                # Pacman install failures are critical.
+                if "pacman" in cmd[0] and ("-U" in cmd or "-Sy" in cmd):
                     raise InjectionError(
                         f"Package installation failed: {result.stderr}"
                     )
