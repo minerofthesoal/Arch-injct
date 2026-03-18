@@ -268,6 +268,7 @@ def download_packages(
 
 def download_signing_key(dest_dir: Path) -> Path:
     """Download the linux-surface GPG signing key."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
     key_path = dest_dir / "surface.asc"
     try:
         subprocess.run(
