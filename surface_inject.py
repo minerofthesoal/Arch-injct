@@ -5,7 +5,7 @@ Surface Kernel ISO Injector - Main entry point.
 Usage:
     python surface_inject.py                  # Interactive CLI
     python surface_inject.py --gui            # Launch GUI
-    python surface_inject.py inject -d sp7 -i arch.iso   # Direct CLI
+    python surface_inject.py inject -d sp7 -i arch.iso   # Direct CLI (Arch/Mint/Ubuntu)
     python surface_inject.py --help           # Show help
 """
 

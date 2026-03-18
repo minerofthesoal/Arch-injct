@@ -1,14 +1,17 @@
 # Surface Kernel ISO Injector
 
-Inject the [linux-surface](https://github.com/linux-surface/linux-surface) kernel into an Arch Linux installer ISO so you can install Arch on a Microsoft Surface device with full hardware support out of the box.
+Inject Surface payloads into installer ISOs with distro-aware workflows:
+- **Arch Linux ISOs**: inject `linux-surface` kernel packages.
+- **Linux Mint / Ubuntu (casper) ISOs**: inject boot-time payload hooks and service assets.
 
 ## What It Does
 
-1. Extracts your Arch Linux ISO
-2. Downloads the latest `linux-surface` kernel and related packages from the official linux-surface Arch repository
-3. Installs them into the ISO's root filesystem
-4. Configures the linux-surface pacman repository for the installed system
-5. Rebuilds the ISO — ready to flash and boot
+1. Detects ISO distro (`arch`, `mint`, or `auto`)
+2. Extracts ISO + rootfs (`airootfs.*` for Arch, `casper/filesystem.squashfs` for Mint/Ubuntu)
+3. Runs distro-specific injection:
+   - Arch: downloads and installs `linux-surface` packages into chroot (with automatic fallback to in-chroot `pacman -Sy` if direct package-file lookup fails)
+   - Mint/Ubuntu: installs payload scripts/systemd service + casper-friendly boot marker
+4. Rebuilds the squashfs and ISO
 
 The resulting ISO boots with Surface-specific drivers for touchscreen, pen, cameras, Wi-Fi, keyboard, and other hardware that the stock kernel doesn't support well.
 
@@ -26,14 +29,20 @@ The resulting ISO boots with Surface-specific drivers for touchscreen, pen, came
 
 ### System packages
 
+Arch host:
 ```bash
 sudo pacman -S squashfs-tools libisoburn curl arch-install-scripts
+```
+
+Mint/Ubuntu host:
+```bash
+sudo apt install squashfs-tools xorriso curl coreutils
 ```
 
 - `squashfs-tools` — for extracting/rebuilding the root filesystem
 - `libisoburn` — provides `xorriso` for ISO manipulation
 - `curl` — for downloading kernel packages
-- `arch-install-scripts` — provides `arch-chroot`
+- `arch-install-scripts` (Arch only) — provides `arch-chroot` (optional; `chroot` fallback is supported)
 
 ### Python
 
@@ -89,8 +98,11 @@ Walks you through:
 ### CLI with Arguments
 
 ```bash
-# Inject with specific device and ISO
+# Inject Arch ISO with specific device and ISO
 sudo python surface_inject.py inject -d sp7 -i ~/Downloads/archlinux-2024.01.01-x86_64.iso
+
+# Inject Mint ISO (auto detection also works)
+sudo python surface_inject.py inject -d sp7 -i ~/Downloads/linuxmint-22.1-cinnamon-64bit.iso --distro mint
 
 # Skip confirmation
 sudo python surface_inject.py inject -d sp7 -i arch.iso -y
@@ -145,7 +157,8 @@ Commands:
 
 inject options:
   -d, --device DEVICE   Surface device ID (e.g. sp7, sl4, sg3)
-  -i, --iso PATH        Path to Arch Linux ISO
+  -i, --iso PATH        Path to Arch/Mint/Ubuntu ISO
+  --distro MODE         auto|arch|mint (default: auto)
   -o, --output PATH     Output ISO path (default: <input>-surface.iso)
   -y, --yes             Skip confirmation prompt
   --force               Continue past preflight warnings
@@ -196,19 +209,20 @@ Arch-injct/
 ## How It Works (Technical)
 
 1. **ISO extraction** — `xorriso` extracts the ISO contents to a temp directory
-2. **Squashfs extraction** — `unsquashfs` unpacks `airootfs.sfs` (the root filesystem)
-3. **Package download** — `curl` pulls `linux-surface`, `linux-surface-headers`, and `iptsd` (for touchscreen devices) from `pkg.surfacelinux.com`
-4. **Chroot installation** — `arch-chroot` + `pacman -U` installs the packages into the extracted root
-5. **Repository config** — Adds the `[linux-surface]` repo to `pacman.conf` so the installed system can update the kernel
-6. **Squashfs rebuild** — `mksquashfs` with zstd compression repacks the modified root
-7. **Checksum update** — Updates sha512 checksums for the new squashfs
-8. **ISO rebuild** — `xorriso` creates the new hybrid ISO with EFI boot support
+2. **Distro detection** — detects Arch vs Mint/Ubuntu using ISO label + filesystem hints (`/arch`, `/casper`)
+3. **Rootfs extraction** — `unsquashfs` unpacks either `airootfs.sfs` (Arch) or `casper/filesystem.squashfs` (Mint/Ubuntu)
+4. **Payload injection**
+   - Arch: download `linux-surface` packages and install in chroot (`arch-chroot` or `chroot`), with repo-install fallback
+   - Mint/Ubuntu: install payload scripts + service + boot marker in grub config
+5. **Squashfs rebuild** — `mksquashfs` repacks the modified root
+6. **Checksum update** — updates sha512 checksums for rebuilt squashfs
+7. **ISO rebuild** — `xorriso` creates the final hybrid ISO
 
 ## Notes
 
 - **Root required** — ISO manipulation and chroot need root privileges
 - **Disk space** — You need roughly 3x the ISO size in free space for the working directory
-- **Network** — Required during injection to download kernel packages
+- **Network** — Required for Arch `linux-surface` package download
 - **UEFI only** — Surface devices boot via UEFI; the rebuilt ISO supports both UEFI and legacy BIOS
 - **ARM Surface devices** (Surface Pro X, Pro 9 5G) are not supported — they use Qualcomm SoCs which need a different kernel approach
 
