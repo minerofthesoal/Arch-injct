@@ -6,11 +6,21 @@ Orchestrates the full workflow: extract ISO -> inject kernel -> rebuild ISO.
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from core.distro_handlers import ArchHandler, DistroHandler, MintHandler
 from core.iso import ArchISO, ISOError
 from core.kernel import KernelError
+from core.network import (
+    DNS_ERROR,
+    MIRROR_ERROR,
+    NETWORK_ERROR,
+    apply_fallback_mirrorlist,
+    classify_pacman_error,
+    ensure_resolv_conf,
+    host_network_status,
+)
 from core.surface_devices import SurfaceDevice
 from utils.log import get_logger
 
@@ -66,6 +76,7 @@ class Injector:
     def preflight_check(self) -> list[str]:
         """Run checks before starting. Returns list of issues (empty = OK)."""
         issues = []
+        import os
 
         missing = ArchISO.check_dependencies()
         if missing:
@@ -101,6 +112,22 @@ class Injector:
             issues.append(
                 f"Distro mismatch: requested '{self.distro}' but ISO looks like '{detected}'"
             )
+        arch_flow = (self.distro == "arch") or (self.distro == "auto" and detected == "arch")
+        if arch_flow and os.geteuid() != 0:
+            issues.append(
+                "Arch kernel injection requires root privileges for bind-mount/chroot. "
+                "Run with sudo."
+            )
+        if arch_flow:
+            net = host_network_status()
+            log.info(
+                "network_check stage=preflight internet=%s dns=%s",
+                net["internet"], net["dns"],
+            )
+            if not net["internet"]:
+                issues.append("No internet connectivity detected on host.")
+            if not net["dns"]:
+                issues.append("DNS lookup failed on host (archlinux.org).")
 
         if self.output_path.exists():
             issues.append(f"Output file already exists: {self.output_path}")
@@ -212,6 +239,7 @@ class Injector:
 
     def _prepare_arch_pacman(self, root: Path, key_path: Path):
         """Initialize pacman keyring in the chroot and trust linux-surface key."""
+        self._repair_network(root, reason="pre_pacman_init")
         self._chroot_run(root, [
             "pacman-key", "--init",
         ])
@@ -232,7 +260,14 @@ class Injector:
         """Bind mount /dev, /proc, /sys into the chroot."""
         for mount in ["dev", "proc", "sys"]:
             target = root / mount
-            target.mkdir(exist_ok=True)
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                log.warning(
+                    "Could not prepare mount target %s (permission denied)",
+                    target,
+                )
+                continue
             try:
                 subprocess.run(
                     ["mount", "--bind", f"/{mount}", str(target)],
@@ -243,7 +278,14 @@ class Injector:
 
         # Mount /dev/pts
         pts = root / "dev" / "pts"
-        pts.mkdir(exist_ok=True)
+        try:
+            pts.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            log.warning(
+                "Could not prepare mount target %s (permission denied)",
+                pts,
+            )
+            return
         try:
             subprocess.run(
                 ["mount", "--bind", "/dev/pts", str(pts)],
@@ -253,11 +295,7 @@ class Injector:
             pass
 
         # resolv.conf for network access in chroot
-        resolv = root / "etc" / "resolv.conf"
-        try:
-            shutil.copy2("/etc/resolv.conf", resolv)
-        except (OSError, FileNotFoundError):
-            pass
+        ensure_resolv_conf(root)
 
     def _unbind_mount(self, root: Path):
         """Unmount bind mounts from the chroot."""
@@ -282,22 +320,69 @@ class Injector:
                 "No chroot runner found (need arch-chroot or chroot)"
             )
         log.info("chroot: %s", " ".join(cmd))
-        try:
-            result = subprocess.run(
-                full_cmd,
-                capture_output=True, text=True, timeout=600,
-            )
-            if result.returncode != 0:
-                log.warning(
-                    "chroot command returned %d: %s",
-                    result.returncode, result.stderr,
+        max_attempts = 4 if ("pacman" in cmd[0]) else 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    full_cmd,
+                    capture_output=True, text=True, timeout=600,
                 )
-                # Pacman install failures are critical.
-                if "pacman" in cmd[0] and ("-U" in cmd or "-Sy" in cmd):
+            except subprocess.TimeoutExpired as exc:
+                if attempt >= max_attempts:
                     raise InjectionError(
-                        f"Package installation failed: {result.stderr}"
+                        f"Package installation failed ({NETWORK_ERROR}): command timed out in chroot."
+                    ) from exc
+                self._repair_network(root, reason="timeout")
+                wait = 2 ** (attempt - 1)
+                log.warning("retry event=timeout attempt=%d wait=%ds", attempt, wait)
+                time.sleep(wait)
+                continue
+
+            if result.returncode == 0:
+                return
+
+            out = f"{result.stdout}\n{result.stderr}"
+            kind = classify_pacman_error(out) if "pacman" in cmd[0] else None
+            log.warning(
+                "chroot_fail cmd=%s code=%d class=%s attempt=%d/%d",
+                " ".join(cmd), result.returncode, kind or "UNKNOWN", attempt, max_attempts,
+            )
+
+            if "pacman" in cmd[0] and ("-U" in cmd or "-Sy" in cmd):
+                if kind and attempt < max_attempts:
+                    self._repair_network(root, reason=kind)
+                    wait = 2 ** (attempt - 1)
+                    log.warning("retry event=pacman attempt=%d class=%s wait=%ds", attempt, kind, wait)
+                    time.sleep(wait)
+                    continue
+
+                if kind in {NETWORK_ERROR, DNS_ERROR, MIRROR_ERROR}:
+                    raise InjectionError(
+                        "Package installation failed "
+                        f"({kind}). Network unavailable inside build environment. "
+                        "Check DNS or container networking."
                     )
-        except subprocess.TimeoutExpired as exc:
-            raise InjectionError(
-                f"Chroot command timed out: {' '.join(cmd)}"
-            ) from exc
+                raise InjectionError(f"Package installation failed: {result.stderr}")
+
+            return
+
+    def _repair_network(self, root: Path, reason: str):
+        """
+        Attempt to make chroot networking usable for pacman operations.
+        """
+        log.info("netfix event=start reason=%s", reason)
+        ensure_resolv_conf(root)
+        if reason == MIRROR_ERROR:
+            apply_fallback_mirrorlist(root)
+        # Try restarting resolver services on host if available.
+        for svc in ["systemd-resolved", "NetworkManager"]:
+            try:
+                subprocess.run(
+                    ["systemctl", "restart", svc],
+                    capture_output=True, text=True, timeout=15,
+                )
+                log.info("netfix event=service_restart service=%s", svc)
+                break
+            except Exception:
+                continue
