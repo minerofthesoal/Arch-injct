@@ -185,7 +185,7 @@ class InjectionWorker(QThread):
 
     def run(self):
         try:
-            injector = Injector(self.iso_path, self.device, self.output_path)
+            injector = Injector(self.iso_path, self.device, self.output_path, distro="auto")
             injector.set_progress_callback(
                 lambda pct, msg: self.progress.emit(pct, msg)
             )
@@ -220,7 +220,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Inject the linux-surface kernel into your Arch Linux installer ISO"
+            "Inject Surface payloads into Arch Linux / Linux Mint / Ubuntu installer ISOs"
         )
         subtitle.setObjectName("subtitleLabel")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -243,11 +243,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(dev_group)
 
         # ISO selection
-        iso_group = QGroupBox("Arch Linux ISO")
+        iso_group = QGroupBox("Installer ISO")
         iso_layout = QHBoxLayout(iso_group)
 
         self.iso_input = QLineEdit()
-        self.iso_input.setPlaceholderText("Select an Arch Linux .iso file...")
+        self.iso_input.setPlaceholderText("Select an Arch/Mint/Ubuntu .iso file...")
         iso_layout.addWidget(self.iso_input)
 
         browse_btn = QPushButton("Browse")
@@ -355,7 +355,7 @@ class MainWindow(QMainWindow):
 
     def _browse_iso(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Arch Linux ISO", "",
+            self, "Select Installer ISO", "",
             "ISO Images (*.iso);;All Files (*)"
         )
         if path:
@@ -385,7 +385,7 @@ class MainWindow(QMainWindow):
             "unsquashfs": "squashfs-tools",
             "mksquashfs": "squashfs-tools",
             "curl": "curl",
-            "arch-chroot": "arch-install-scripts",
+            "chroot": "coreutils (or arch-install-scripts for arch-chroot)",
         }
         all_ok = True
         for tool, pkg in tools.items():
@@ -393,13 +393,15 @@ class MainWindow(QMainWindow):
             if found:
                 self._log(f"  ✓ {tool}", "#a6e3a1")
             else:
-                self._log(f"  ✗ {tool} - install with: pacman -S {pkg}", "#f38ba8")
+                self._log(f"  ✗ {tool} - install with package: {pkg}", "#f38ba8")
                 all_ok = False
 
         if all_ok:
             self._log("All dependencies satisfied!", "#a6e3a1")
         else:
             self._log("Install missing packages before injecting.", "#fab387")
+            self._log("  Arch: pacman -S squashfs-tools libisoburn curl arch-install-scripts", "#fab387")
+            self._log("  Mint/Ubuntu: apt install squashfs-tools xorriso curl coreutils", "#fab387")
 
     def _check_version(self):
         self._log("Querying linux-surface repository...", "#89b4fa")
@@ -425,7 +427,7 @@ class MainWindow(QMainWindow):
         if not iso_path:
             QMessageBox.warning(
                 self, "No ISO Selected",
-                "Please select an Arch Linux ISO file."
+                "Please select an Arch/Mint/Ubuntu ISO file."
             )
             return
 
