@@ -61,11 +61,31 @@ def ensure_resolv_conf(chroot_root: Path):
 
     nameserver_fallback = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
 
+    def _has_non_loopback_nameserver(text: str) -> bool:
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.lower().startswith("nameserver"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ns = parts[1].strip()
+            if ns.startswith("127.") or ns == "0.0.0.0" or ns == "::1":
+                continue
+            return True
+        return False
+
     try:
         host_resolv = Path("/etc/resolv.conf")
         if host_resolv.is_file() and host_resolv.read_text().strip():
             content = host_resolv.read_text()
-            if "nameserver" not in content:
+            if not _has_non_loopback_nameserver(content):
+                log.warning(
+                    "netfix event=ensure_resolv_conf reason=loopback_or_missing_nameserver "
+                    "action=use_public_dns"
+                )
                 content = nameserver_fallback
             resolv.write_text(content)
             log.info(
@@ -114,4 +134,3 @@ def apply_fallback_mirrorlist(chroot_root: Path):
             mirrorlist,
             exc,
         )
-
